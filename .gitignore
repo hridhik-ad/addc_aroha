@@ -1,0 +1,12 @@
+# Virtual Environments (The folder names you have)
+flight_control/flight_env/
+hailo-rpi5-examples/venv_hailo_rpi_examples/
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Large Media Files
+*.mp4
+*.h264
+*.avi
