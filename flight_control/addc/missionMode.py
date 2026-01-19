@@ -8,7 +8,7 @@ from controller import DroneController
 LANDING_PAD_X = 0.5  # Meters North (x)
 LANDING_PAD_Y = 19.0   # Meters East (y)
 FLIGHT_ALTITUDE = 4.0 # Meters
-CONNECTION_STRING = "udpin://0.0.0.0:14540"
+CONNECTION_STRING = "udpin://0.0.0.0:14550"
 
 async def run():
     drone = System()
