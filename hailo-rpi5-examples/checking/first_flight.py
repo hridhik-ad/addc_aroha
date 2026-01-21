@@ -13,12 +13,13 @@ from hailo_apps.hailo_app_python.apps.detection_simple.detection_pipeline_simple
 # -----------------------------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------------------------
-HOST_IP = "10.42.0.1"
+CAM_DEVICE = "/dev/video0"
+CAM_WIDTH = 640
+CAM_HEIGHT = 480
+RECORD_PATH = "/home/pi/flight_record.mkv"
 HEF_PATH = "/home/pi/aroha_addc/hailo-rpi5-examples/custom_hef/qr_simulation.hef"
 POST_PROCESS_SO = "/usr/local/hailo/resources/so/libyolo_hailortpp_postprocess.so"
 ZMQ_PORT = 5555
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 640
 # -----------------------------------------------------------------------------------------------
 
 class user_app_callback_class(app_callback_class):
@@ -26,13 +27,9 @@ class user_app_callback_class(app_callback_class):
         super().__init__()
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
-        
-        # --- LATENCY FIX 1: Set High Water Mark to 1 ---
-        # This prevents buffering. If the receiver is slow, drop the packet.
-        self.socket.setsockopt(zmq.SNDHWM, 1)
-        
+        self.socket.setsockopt(zmq.SNDHWM, 1) # Internal ZMQ buffer limit
         self.socket.bind(f"tcp://*:{ZMQ_PORT}")
-        print(f"ZMQ Publisher started on port {ZMQ_PORT}")
+        print(f"[Hailo] ZMQ Publisher bound to port {ZMQ_PORT}")
 
 def app_callback(pad, info, user_data):
     user_data.increment()
@@ -44,29 +41,16 @@ def app_callback(pad, info, user_data):
     valid_detections = []
     
     for detection in detections:
-        confidence_pct = detection.get_confidence() * 100
-        
-        if confidence_pct > 75: # Slightly lowered to prevent "flicker" loss
+        if detection.get_confidence() > 0.50: 
             bbox = detection.get_bbox()
-            
-            # 1. Get Normalized Coordinates
-            norm_xmin = bbox.xmin()
-            norm_ymin = bbox.ymin()
-            norm_xmax = bbox.xmax()
-            norm_ymax = bbox.ymax()
+            norm_center_x = (bbox.xmin() + bbox.xmax()) / 2.0
+            norm_center_y = (bbox.ymin() + bbox.ymax()) / 2.0
 
-            # 2. Calculate Center
-            norm_center_x = (norm_xmin + norm_xmax) / 2
-            norm_center_y = (norm_ymin + norm_ymax) / 2
-
-            # 3. Calculate Error (-1.0 to 1.0)
-            # Center of screen is 0.5. 
-            # If object is at 0.0 (Left), error is -1.0
-            # If object is at 1.0 (Right), error is +1.0
             error_x = (norm_center_x - 0.5) * 2
             error_y = (norm_center_y - 0.5) * 2
 
             obj_data = {
+                "label": detection.get_label(),
                 "normalized_error": {
                     "x": float(f"{error_x:.4f}"), 
                     "y": float(f"{error_y:.4f}")
@@ -74,42 +58,62 @@ def app_callback(pad, info, user_data):
             }
             valid_detections.append(obj_data)
     
-    # Send via ZMQ
     if len(valid_detections) > 0:
-        json_output = {
-            "detections": valid_detections
-        }
+        json_output = {"detections": valid_detections}
         try:
-            # NOBLOCK ensures the camera never freezes if network is busy
             user_data.socket.send_json(json_output, flags=zmq.NOBLOCK)
         except zmq.Again:
-            pass # Drop frame if busy (Good for low latency)
-        except Exception as e:
-            print(f"ZMQ Send Error: {e}")
+            pass 
         
     return Gst.PadProbeReturn.OK
 
-class GStreamerUDPHailoApp(GStreamerDetectionApp):
+class GStreamerUSBRecorderApp(GStreamerDetectionApp):
     def __init__(self, callback, user_data):
         super().__init__(callback, user_data)
         
     def get_pipeline_string(self):
-        # --- LATENCY FIX 2: Optimized Pipeline Queue ---
-        # "queue leaky=downstream max-size-buffers=1" forces the pipeline
-        # to drop old frames instantly if it gets backed up.
+        # ---------------------------------------------------------
+        # ROBUST RECORDING PIPELINE (Fixes Black Screen)
+        # ---------------------------------------------------------
         pipeline = (
-            f"udpsrc port=5000 buffer-size=0 ! "
-            f"application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H264, payload=(int)96 ! "
-            f"rtph264depay ! h264parse ! avdec_h264 ! "
-            f"queue leaky=downstream max-size-buffers=1 ! " 
-            f"videoscale ! videoconvert ! "
+            # 1. SOURCE: USB Webcam (640x480)
+            f"v4l2src device={CAM_DEVICE} io-mode=2 ! "
+            f"video/x-raw, width={CAM_WIDTH}, height={CAM_HEIGHT}, framerate=30/1 ! "
+            
+            # 2. DROP QUEUE (Force Latest Frame)
+            f"queue name=src_q leaky=downstream max-size-buffers=1 ! "
+            
+            # 3. SCALE & CONVERT (RGB for Hailo)
+            f"videoscale ! "
+            f"videoconvert ! "
             f"video/x-raw, format=RGB, width=640, height=640, pixel-aspect-ratio=1/1 ! "
+            
+            # 4. INFERENCE
             f"hailonet hef-path={HEF_PATH} ! "
             f"hailofilter so-path={POST_PROCESS_SO} qos=false ! "
+            
+            # 5. CONTROL POINT
             f"identity name=identity_callback ! " 
-            f"hailooverlay ! "
-            f"videoconvert ! x264enc tune=zerolatency speed-preset=ultrafast ! "
-            f"rtph264pay ! udpsink host={HOST_IP} port=5001 sync=false"
+            f"hailooverlay ! " 
+            
+            # 6. RECORDING QUEUE
+            f"queue name=rec_q max-size-time=0 max-size-bytes=0 max-size-buffers=0 ! "
+            
+            # 7. COLOR CONVERSION (Fixes Black Screen Part 1)
+            # x264enc needs I420 (YUV), not RGB. We must convert it here.
+            f"videoconvert ! "
+            f"video/x-raw, format=I420 ! "
+            
+            # 8. ENCODING
+            f"x264enc tune=zerolatency speed-preset=superfast bitrate=2500 ! "
+            
+            # 9. PARSING (Fixes Black Screen Part 2)
+            # Critical: Organizing the H.264 stream so .mkv understands it
+            f"h264parse ! "
+            
+            # 10. CONTAINER
+            f"matroskamux ! "
+            f"filesink location={RECORD_PATH}"
         )
         return pipeline
 
@@ -118,6 +122,7 @@ if __name__ == "__main__":
     env_file = project_root / ".env"
     os.environ["HAILO_ENV_FILE"] = str(env_file)
     
+    print("[Hailo] Starting Pipeline (Low Latency Mode)...")
     user_data = user_app_callback_class()
-    app = GStreamerUDPHailoApp(app_callback, user_data)
+    app = GStreamerUSBRecorderApp(app_callback, user_data)
     app.run()
