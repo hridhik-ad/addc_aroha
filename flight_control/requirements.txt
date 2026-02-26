@@ -1,0 +1,4 @@
+mavsdk
+pyzmq
+opencv-python
+numpy
